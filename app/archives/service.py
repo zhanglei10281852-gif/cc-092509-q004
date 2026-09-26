@@ -12,6 +12,7 @@ from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
 from app.archives.repository import IncidentRepository, ApprovalRepository, IntakeRepository, VaultRepository, DossierRepository
 from app.archives.validation import require_code
+from app.ownership.service import OwnershipService
 from app.services.audit import AuditService
 
 
@@ -58,6 +59,7 @@ class DossierLifecycleService:
         self.dossiers = DossierRepository(connection)
         self.batches = IntakeRepository(connection)
         self.vaults = VaultRepository(connection)
+        self.ownership = OwnershipService(connection, self.clock)
         self.audit = AuditService(connection, self.clock)
 
     def create_batch(self, principal: Principal, data: dict[str, Any]) -> dict[str, Any]:
@@ -135,6 +137,9 @@ class DossierLifecycleService:
                 now,
             )
             self.dossiers.append_event(child["id"], "issue_copy.created", principal.user_id, now, to_state="available", details={"source_dossier_id": dossier_id})
+            self.ownership.pin_reference(
+                "disclosure_version", child["id"], child["dossier_code"], dossier_id, now
+            )
             children.append(child)
         operation_code = data.get("operation_code") or f"ALI-{uuid.uuid4().hex[:12]}"
         self.connection.execute(
@@ -169,6 +174,9 @@ class DossierLifecycleService:
             (dossier_id, data["recipient_code"], data["quantity"], principal.user_id, data["idempotency_key"], now, data.get("note", ""), now),
         )
         record = dict(self.connection.execute("SELECT * FROM disclosure_use_records WHERE id=?", (cursor.lastrowid,)).fetchone())
+        self.ownership.pin_reference(
+            "external_disclosure", record["id"], data["recipient_code"], dossier_id, now
+        )
         self.dossiers.append_event(dossier_id, "disclosed", principal.user_id, now, quantity_delta=-data["quantity"], from_state=dossier["lifecycle_state"], to_state=new_state, details={"recipient_code": data["recipient_code"]})
         self.audit.record(principal, "dossier.disclose", "dossier", str(dossier_id), before=dossier, after=updated)
         return {"record": record, "dossier": updated, "replayed": False}

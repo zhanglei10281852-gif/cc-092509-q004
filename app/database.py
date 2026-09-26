@@ -335,6 +335,113 @@ CREATE TABLE IF NOT EXISTS dossier_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dossier_events_dossier ON dossier_events(dossier_id, id);
+
+CREATE TABLE IF NOT EXISTS ownership_units (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ownership_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('dossier','patent_family','external_disclosure')),
+    subject_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    agreement_id INTEGER,
+    effective_at TEXT NOT NULL,
+    superseded_at TEXT,
+    shares_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(subject_type, subject_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_ownership_snapshots_subject
+    ON ownership_snapshots(subject_type, subject_id, effective_at);
+
+CREATE TABLE IF NOT EXISTS ownership_agreements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agreement_code TEXT NOT NULL UNIQUE,
+    subject_type TEXT NOT NULL,
+    subject_id INTEGER NOT NULL,
+    change_kind TEXT NOT NULL CHECK(change_kind IN ('initial','transfer','supplement','withdrawal')),
+    supersedes_agreement_id INTEGER REFERENCES ownership_agreements(id),
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    cross_unit INTEGER NOT NULL CHECK(cross_unit IN (0, 1)),
+    state TEXT NOT NULL CHECK(state IN ('pending_review','effective','rejected','withdrawn','superseded')),
+    required_approvals INTEGER NOT NULL DEFAULT 2,
+    effective_at TEXT,
+    requested_by INTEGER NOT NULL REFERENCES users(id),
+    note TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(subject_type, subject_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_ownership_agreements_subject
+    ON ownership_agreements(subject_type, subject_id, id);
+
+CREATE TABLE IF NOT EXISTS ownership_agreement_signers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agreement_id INTEGER NOT NULL REFERENCES ownership_agreements(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    signer_role TEXT NOT NULL DEFAULT 'inventor',
+    signed_at TEXT NOT NULL,
+    UNIQUE(agreement_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS ownership_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agreement_id INTEGER NOT NULL REFERENCES ownership_agreements(id) ON DELETE CASCADE,
+    reviewer_user_id INTEGER NOT NULL REFERENCES users(id),
+    decision TEXT NOT NULL CHECK(decision IN ('approve','reject')),
+    comment TEXT NOT NULL DEFAULT '',
+    decided_at TEXT NOT NULL,
+    UNIQUE(agreement_id, reviewer_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS ownership_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_type TEXT NOT NULL,
+    subject_id INTEGER NOT NULL,
+    agreement_id INTEGER,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    actor_user_id INTEGER REFERENCES users(id),
+    details_json TEXT NOT NULL DEFAULT '{}',
+    prev_event_id INTEGER,
+    chain_digest TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    UNIQUE(subject_type, subject_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_ownership_events_subject ON ownership_events(subject_type, subject_id, seq);
+
+CREATE TABLE IF NOT EXISTS ownership_references (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref_kind TEXT NOT NULL CHECK(ref_kind IN ('disclosure_version','patent_family','external_disclosure')),
+    ref_id INTEGER NOT NULL,
+    ref_code TEXT NOT NULL DEFAULT '',
+    subject_type TEXT NOT NULL,
+    subject_id INTEGER NOT NULL,
+    snapshot_id INTEGER NOT NULL REFERENCES ownership_snapshots(id),
+    pinned_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(ref_kind, ref_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ownership_references_subject
+    ON ownership_references(subject_type, subject_id);
+
+CREATE TABLE IF NOT EXISTS patent_families (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    family_code TEXT NOT NULL UNIQUE,
+    root_dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    title TEXT NOT NULL,
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    ownership_snapshot_id INTEGER REFERENCES ownership_snapshots(id),
+    created_at TEXT NOT NULL
+);
 """
 
 PERMISSIONS = [
@@ -353,6 +460,9 @@ PERMISSIONS = [
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("vaults.read_sensitive", "查看精确密级库位", "vaults", "read_sensitive"),
     ("incidents.manage", "管理泄密事件", "incidents", "manage"),
+    ("ownership.read", "查看权属档案", "ownership", "read"),
+    ("ownership.write", "维护权属与转让协议", "ownership", "write"),
+    ("ownership.review", "复核跨单位权属转让", "ownership", "review"),
 ]
 
 
@@ -432,10 +542,11 @@ def init_db() -> None:
             "dossier_manager": [
                 "dossiers.read", "dossiers.write", "dossiers.disclose", "dossiers.dispose",
                 "access_loans.manage", "inventory_review.manage", "incidents.manage",
+                "ownership.read", "ownership.write",
             ],
             "researcher": ["dossiers.read", "dossiers.disclose"],
-            "approver": ["dossiers.read", "approvals.decide"],
-            "auditor": ["dossiers.read", "audit.read"],
+            "approver": ["dossiers.read", "approvals.decide", "ownership.review", "ownership.read"],
+            "auditor": ["dossiers.read", "audit.read", "ownership.read"],
         }
         for role_code, permission_codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
