@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS disclosure_use_records (
 CREATE TABLE IF NOT EXISTS approval_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_code TEXT NOT NULL UNIQUE,
-    action_type TEXT NOT NULL CHECK(action_type IN ('access_loan','disposal','vault_reveal','inventory_review_adjustment')),
+    action_type TEXT NOT NULL CHECK(action_type IN ('access_loan','disposal','vault_reveal','inventory_review_adjustment','ownership_transfer')),
     resource_type TEXT NOT NULL,
     resource_id INTEGER NOT NULL,
     requested_by INTEGER NOT NULL REFERENCES users(id),
@@ -335,6 +335,126 @@ CREATE TABLE IF NOT EXISTS dossier_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dossier_events_dossier ON dossier_events(dossier_id, id);
+
+CREATE TABLE IF NOT EXISTS ownership_units (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    unit_code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS inventors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inventor_code TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    home_unit_id INTEGER REFERENCES ownership_units(id),
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ownership_unit_signers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    unit_id INTEGER NOT NULL REFERENCES ownership_units(id),
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    title TEXT NOT NULL DEFAULT '',
+    valid_from TEXT NOT NULL,
+    valid_until TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(unit_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS ownership_agreements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agreement_code TEXT NOT NULL UNIQUE,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    kind TEXT NOT NULL CHECK(kind IN ('baseline','assignment','supplement','withdrawal')),
+    parent_agreement_id INTEGER REFERENCES ownership_agreements(id),
+    idempotency_key TEXT,
+    payload_digest TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending_review','approved','effective','rejected','withdrawn')),
+    effective_from TEXT NOT NULL,
+    effective_until TEXT,
+    approval_request_id INTEGER REFERENCES approval_requests(id),
+    reason TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    submitted_by INTEGER NOT NULL REFERENCES users(id),
+    submitted_at TEXT NOT NULL,
+    decided_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ownership_agreements_idem
+    ON ownership_agreements(dossier_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ownership_agreements_dossier ON ownership_agreements(dossier_id, state);
+
+CREATE TABLE IF NOT EXISTS ownership_agreement_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agreement_id INTEGER NOT NULL REFERENCES ownership_agreements(id) ON DELETE CASCADE,
+    inventor_id INTEGER NOT NULL REFERENCES inventors(id),
+    unit_id INTEGER NOT NULL REFERENCES ownership_units(id),
+    share_percent REAL NOT NULL CHECK(share_percent > 0 AND share_percent <= 100),
+    valid_from TEXT NOT NULL,
+    valid_until TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(agreement_id, inventor_id)
+);
+
+CREATE TABLE IF NOT EXISTS ownership_agreement_signatures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agreement_id INTEGER NOT NULL REFERENCES ownership_agreements(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    role TEXT NOT NULL CHECK(role IN ('inventor','unit_representative')),
+    inventor_id INTEGER REFERENCES inventors(id),
+    unit_id INTEGER REFERENCES ownership_units(id),
+    signed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ownership_signatures_unique
+    ON ownership_agreement_signatures(agreement_id, user_id, role, IFNULL(inventor_id, 0), IFNULL(unit_id, 0));
+
+CREATE TABLE IF NOT EXISTS ownership_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    agreement_id INTEGER NOT NULL REFERENCES ownership_agreements(id),
+    seq INTEGER NOT NULL,
+    inventor_id INTEGER NOT NULL REFERENCES inventors(id),
+    unit_id INTEGER NOT NULL REFERENCES ownership_units(id),
+    share_percent REAL NOT NULL CHECK(share_percent > 0 AND share_percent <= 100),
+    valid_from TEXT NOT NULL,
+    valid_until TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(agreement_id, inventor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ownership_snapshots_dossier ON ownership_snapshots(dossier_id, agreement_id);
+
+CREATE TABLE IF NOT EXISTS ownership_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    agreement_id INTEGER REFERENCES ownership_agreements(id),
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    actor_user_id INTEGER REFERENCES users(id),
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    event_digest TEXT NOT NULL,
+    chain_digest TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    UNIQUE(dossier_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS ownership_references (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    ref_type TEXT NOT NULL CHECK(ref_type IN ('disclosure_version','patent_family','external_disclosure')),
+    ref_code TEXT NOT NULL,
+    agreement_id INTEGER NOT NULL REFERENCES ownership_agreements(id),
+    pinned_by INTEGER NOT NULL REFERENCES users(id),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(dossier_id, ref_type, ref_code)
+);
 """
 
 PERMISSIONS = [
@@ -353,6 +473,8 @@ PERMISSIONS = [
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("vaults.read_sensitive", "查看精确密级库位", "vaults", "read_sensitive"),
     ("incidents.manage", "管理泄密事件", "incidents", "manage"),
+    ("ownership.read", "查看权属快照", "ownership", "read"),
+    ("ownership.manage", "维护权属协作", "ownership", "manage"),
 ]
 
 
@@ -432,10 +554,11 @@ def init_db() -> None:
             "dossier_manager": [
                 "dossiers.read", "dossiers.write", "dossiers.disclose", "dossiers.dispose",
                 "access_loans.manage", "inventory_review.manage", "incidents.manage",
+                "ownership.read", "ownership.manage",
             ],
             "researcher": ["dossiers.read", "dossiers.disclose"],
             "approver": ["dossiers.read", "approvals.decide"],
-            "auditor": ["dossiers.read", "audit.read"],
+            "auditor": ["dossiers.read", "audit.read", "ownership.read"],
         }
         for role_code, permission_codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]

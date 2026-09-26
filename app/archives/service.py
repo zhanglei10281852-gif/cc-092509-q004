@@ -259,6 +259,8 @@ class ApprovalService:
     def decide(self, principal: Principal, request_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("approvals.decide")
         before = self.approvals.get(request_id)
+        if before["action_type"] == "ownership_transfer":
+            raise ValidationError("权属转让复核请通过权属协作接口处理")
         result = self.approvals.decide(request_id, principal.user_id, data["decision"], data.get("comment", ""), to_storage(self.clock.now()))
         self.audit.record(principal, "approval.decide", "approval_request", str(request_id), before=before, after=result)
         return result
